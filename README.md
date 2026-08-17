@@ -26,7 +26,7 @@ Also install Python 3 and an LLVM toolchain containing `llvm-strings` (the analy
 Then run:
 
 ```bash
-./run_local.sh
+bash run_local.sh
 ```
 
 Open `http://127.0.0.1:5000`.
@@ -37,7 +37,7 @@ Some stripped libraries do not retain a readable Unity version. In that case set
 
 ```bash
 export UNITY_VERSION_OVERRIDE=2021.3.45
-./run_local.sh
+bash run_local.sh
 ```
 
 ## Accuracy note

@@ -1,86 +1,290 @@
 from __future__ import annotations
-import json, os, re, shutil, subprocess, tempfile
+
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
+
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 app = Flask(__name__)
 MAX_MB = int(os.environ.get('MAX_UPLOAD_MB', '2048'))
 app.config['MAX_CONTENT_LENGTH'] = MAX_MB * 1024 * 1024
+REPO = 'LavaGang/MelonLoader.UnityDependencies'
 
-HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SymbolMap Maker</title><style>
-body{font-family:system-ui;background:#09090b;color:#f4f4f5;max-width:850px;margin:auto;padding:42px 18px}h1{font-size:40px}.card{background:#111113;border:1px solid #27272a;border-radius:16px;padding:22px;margin:16px 0}.drop{display:block;border:2px dashed #52525b;border-radius:12px;padding:32px;text-align:center;cursor:pointer}.drop:hover{border-color:#a1a1aa}input{display:none}button{padding:12px 18px;border:0;border-radius:10px;font-weight:700;cursor:pointer}button:disabled{opacity:.4}.status{white-space:pre-wrap;background:#050506;padding:15px;border-radius:10px;margin-top:15px;font-family:monospace}.muted{color:#a1a1aa}</style></head><body>
-<h1>SymbolMap Maker</h1><p class="muted">Upload one target <b>libunity.so</b>. Processing happens on this machine; the uploaded binary is never committed to GitHub.</p>
-<div class="card"><label class="drop" for="so">Choose libunity.so<input id="so" type="file" accept=".so,application/octet-stream"></label><p id="name" class="muted">No file selected.</p><button id="go" disabled>Analyze &amp; Generate SymbolMap.json</button><div id="status" class="status">Waiting for libunity.so…</div></div>
-<script>const so=document.querySelector('#so'),go=document.querySelector('#go'),name=document.querySelector('#name'),status=document.querySelector('#status');let f;so.onchange=()=>{f=so.files[0];name.textContent=f?`${f.name} — ${f.size.toLocaleString()} bytes`:'';go.disabled=!f};go.onclick=async()=>{go.disabled=true;status.textContent='Uploading to the local analyzer…';try{const fd=new FormData();fd.append('libunity',f);const r=await fetch('/analyze',{method:'POST',body:fd});const j=await r.json();if(!r.ok)throw Error(j.error||'Analysis failed');status.textContent=j.message;const a=document.createElement('a');a.href='/download/'+j.id;a.download='SymbolMap.json';a.click()}catch(e){status.textContent='Error: '+e.message}finally{go.disabled=!f};};</script></body></html>'''
+# The server is deliberately local-only when run normally. The uploaded library is kept
+# under a temporary directory and is removed on errors; the final JSON is also temporary.
+HTML = open(Path(__file__).with_name('index.html'), encoding='utf-8').read()
 
-def run(cmd, cwd=None):
-    p=subprocess.run(cmd,cwd=cwd,text=True,capture_output=True,timeout=600)
-    if p.returncode: raise RuntimeError(p.stderr.strip() or 'command failed')
+
+def run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 3600) -> str:
+    p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=timeout)
+    if p.returncode:
+        raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f'Command failed: {cmd[0]}')
     return p.stdout
 
-def readelf_functions(path):
-    # llvm-readelf is preferred, matching the tutorial. Fall back to readelf.
-    exe=shutil.which('llvm-readelf') or shutil.which('readelf')
-    if not exe: raise RuntimeError('llvm-readelf/readelf is not installed on the server.')
-    out=run([exe,'-Ws',str(path)])
-    rows=[]
-    for line in out.splitlines():
-        if ' FUNC ' not in line: continue
-        parts=line.split()
-        # GNU/LLVM output normally ends: Ndx Size Type Bind Vis Ndx Name
+
+def tool(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def elf_info(path: Path) -> tuple[int, int]:
+    data = path.read_bytes()[:64]
+    if len(data) < 20 or data[:4] != b'\x7fELF':
+        raise RuntimeError('The selected file is not an ELF binary.')
+    if data[5] != 1:
+        raise RuntimeError('Only little-endian Android ELF files are supported.')
+    return data[4], int.from_bytes(data[18:20], 'little')
+
+
+def strings_text(path: Path) -> str:
+    exe = tool('llvm-strings') or tool('strings')
+    if not exe:
+        return ''
+    return run([exe, '-a', str(path)], timeout=600)
+
+
+def detect_unity_version(path: Path) -> str:
+    text = strings_text(path)
+    # Unity commonly leaves its editor/runtime version in plain ASCII. Accept both
+    # exact f/build forms and the shorter release form used by UnityDependencies.
+    pats = [
+        r'Unity\s+(20\d{2}\.\d+\.\d+(?:f\d+)?)',
+        r'\b(20\d{2}\.\d+\.\d+f\d+)\b',
+        r'\b(20\d{2}\.\d+\.\d+)\b',
+    ]
+    for pat in pats:
+        m = re.search(pat, text)
+        if m:
+            v = m.group(1)
+            return re.sub(r'f\d+$', '', v)
+    raise RuntimeError('Could not detect a Unity version from libunity.so. Set UNITY_VERSION_OVERRIDE to the matching Unity release before starting the server.')
+
+
+def unity_release(version: str) -> dict:
+    def get(url: str) -> dict | list:
+        req = urllib.request.Request(url, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'symbolmap-maker'})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+
+    tag_url = f'https://api.github.com/repos/{REPO}/releases/tags/{version}'
+    try:
+        x = get(tag_url)
+        if isinstance(x, dict):
+            return x
+    except Exception:
+        pass
+
+    # Fall back to release pages and locate a tag that starts with the detected version.
+    for page in range(1, 5):
+        arr = get(f'https://api.github.com/repos/{REPO}/releases?per_page=100&page={page}')
+        if not isinstance(arr, list):
+            continue
+        for r in arr:
+            tag = str(r.get('tag_name', ''))
+            if tag == version or tag.startswith(version + '.') or tag.startswith(version + 'f'):
+                return r
+    raise RuntimeError(f'No UnityDependencies release was found for Unity {version}.')
+
+
+def download_clean_libunity(work: Path, version: str, machine: int) -> Path:
+    release = unity_release(version)
+    assets = release.get('assets', [])
+    if not assets:
+        raise RuntimeError(f'UnityDependencies {version} has no downloadable assets.')
+
+    # Prefer Android/runtime archives. We still inspect archive contents rather than
+    # trusting the asset name because the repository has changed packaging over time.
+    preferred = []
+    for asset in assets:
+        name = str(asset.get('name', ''))
+        low = name.lower()
+        if name.endswith('.zip') and ('android' in low or 'runtime' in low or 'dependencies' in low):
+            preferred.append(asset)
+    preferred += [a for a in assets if a not in preferred and str(a.get('name', '')).endswith('.zip')]
+
+    wanted = 'arm64' if machine == 183 else 'arm' if machine == 40 else ''
+    for asset in preferred:
+        aid = asset.get('id')
+        name = str(asset.get('name', ''))
+        if not aid:
+            continue
+        archive = work / name
+        url = f'https://api.github.com/repos/{REPO}/releases/assets/{aid}'
+        req = urllib.request.Request(url, headers={'Accept': 'application/octet-stream', 'User-Agent': 'symbolmap-maker'})
         try:
-            idx=parts.index('FUNC'); size=int(parts[idx-1],16); value=int(parts[idx-2],16); name=parts[idx+4] if len(parts)>idx+4 else parts[-1]
-        except (ValueError,IndexError):
+            with urllib.request.urlopen(req, timeout=180) as r, archive.open('wb') as f:
+                shutil.copyfileobj(r, f)
+            with zipfile.ZipFile(archive) as z:
+                candidates = [n for n in z.namelist() if n.lower().endswith('/libunity.so') or n.lower() == 'libunity.so']
+                if wanted:
+                    arch_candidates = [n for n in candidates if wanted in n.lower()]
+                    if arch_candidates:
+                        candidates = arch_candidates
+                if not candidates:
+                    continue
+                chosen = sorted(candidates, key=lambda x: (x.lower().count('android'), len(x)))[0]
+                out = work / 'clean-libunity.so'
+                with z.open(chosen) as src, out.open('wb') as dst:
+                    shutil.copyfileobj(src, dst)
+                return out
+        except (urllib.error.URLError, zipfile.BadZipFile, OSError):
             continue
-        if name and name not in ('UND',): rows.append({'name':name,'value':value,'size':size})
-    return rows
+    raise RuntimeError(f'Could not find a compatible clean libunity.so inside UnityDependencies {version}.')
 
-def strings(path):
-    exe=shutil.which('llvm-strings') or shutil.which('strings')
-    if not exe: return []
-    return run([exe,'-a','-t','d',str(path)]).splitlines()
 
-def analyze(path):
-    fns=readelf_functions(path)
-    strs=strings(path)
-    # Produce a conservative map only where the binary itself exposes an unambiguous
-    # original symbol. We never invent names. Obfuscated/stripped functions are reported.
-    mappings={}
-    for f in fns:
-        n=f['name']
-        if not re.search(r'(?:^|[_$])(?:method|function|invoke|rgctx|generic|thunk)(?:[_$]|$)',n,re.I):
+def ghidra_headless() -> Path | None:
+    override = os.environ.get('GHIDRA_HEADLESS')
+    if override and Path(override).exists():
+        return Path(override)
+    home = os.environ.get('GHIDRA_HOME')
+    if home:
+        p = Path(home) / 'support' / ('analyzeHeadless.bat' if os.name == 'nt' else 'analyzeHeadless')
+        if p.exists():
+            return p
+    exe = tool('analyzeHeadless')
+    return Path(exe) if exe else None
+
+
+def export_pseudocode(binary: Path, output: Path, job: Path) -> None:
+    headless = ghidra_headless()
+    if not headless:
+        raise RuntimeError('Ghidra headless is required. Set GHIDRA_HOME (or GHIDRA_HEADLESS) to a Ghidra installation.')
+    project_dir = job / ('ghidra-' + binary.stem)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    project_name = 'symbolmap'
+    cmd = [str(headless), str(project_dir), project_name, '-import', str(binary), '-scriptPath', str(Path(__file__).parent), '-postScript', 'ExportPseudo.java', str(output), '-deleteProject']
+    run(cmd, cwd=job, timeout=3600)
+    if not output.exists() or output.stat().st_size == 0:
+        raise RuntimeError(f'Ghidra did not produce pseudocode for {binary.name}.')
+
+
+def load_pseudocode(path: Path) -> list[dict]:
+    raw = path.read_text(encoding='utf-8', errors='replace')
+    records = []
+    # Format emitted by ExportPseudo.java: a header line followed by C text until the next header.
+    chunks = re.split(r'(?m)^@@FUNC@@\t', raw)
+    for chunk in chunks[1:]:
+        lines = chunk.splitlines()
+        if not lines:
             continue
-        # Keep only names that look like actual symbols rather than local compiler noise.
-        if n.startswith('_Z') or n.startswith('sub_'):
+        head = lines[0].split('\t', 1)
+        if len(head) != 2:
             continue
-        mappings[n]=n
-    return mappings, fns, strs
+        address, name = head
+        records.append({'address': address, 'name': name, 'code': '\n'.join(lines[1:])})
+    return records
+
+
+def normalize(code: str, names: set[str]) -> str:
+    x = re.sub(r'/\*.*?\*/', ' ', code, flags=re.S)
+    x = re.sub(r'//.*', ' ', x)
+    x = re.sub(r'0x[0-9A-Fa-f]+', ' ADDR ', x)
+    x = re.sub(r'\b\d+(?:\.\d+)?\b', ' NUM ', x)
+    # Ghidra local identifiers and generated function labels are not stable between binaries.
+    x = re.sub(r'\b(local|param|in_stack|unaff|extraout|uVar|iVar|fVar|dVar|cVar|bVar|auVar|puVar)_\w+\b', ' VAR ', x)
+    for n in sorted(names, key=len, reverse=True):
+        if n:
+            x = re.sub(r'(?<![\w$])' + re.escape(n) + r'(?![\w$])', ' FUNC ', x)
+    x = re.sub(r'\s+', ' ', x).strip()
+    return x
+
+
+def map_decompiled(target: list[dict], clean: list[dict]) -> dict[str, str]:
+    clean_names = {f['name'] for f in clean}
+    target_names = {f['name'] for f in target}
+    clean_norm = [(f, normalize(f['code'], clean_names)) for f in clean]
+    exact: dict[str, list[dict]] = {}
+    for f, n in clean_norm:
+        if n:
+            exact.setdefault(n, []).append(f)
+
+    result: dict[str, str] = {}
+    used: set[str] = set()
+    for f in target:
+        n = normalize(f['code'], target_names | clean_names)
+        candidates = exact.get(n, [])
+        if len(candidates) == 1 and candidates[0]['name'] not in used:
+            result[f['name']] = candidates[0]['name']
+            used.add(candidates[0]['name'])
+
+    # Similarity fallback for minor compiler/Ghidra differences. Restrict candidates by
+    # normalized size so matching stays tractable on large libunity.so files.
+    buckets: dict[int, list[tuple[dict, str]]] = {}
+    for f, n in clean_norm:
+        buckets.setdefault(len(n) // 250, []).append((f, n))
+    for f in target:
+        if f['name'] in result:
+            continue
+        n = normalize(f['code'], target_names | clean_names)
+        if not n:
+            continue
+        candidates = []
+        b = len(n) // 250
+        for bb in range(max(0, b - 1), b + 2):
+            candidates.extend(buckets.get(bb, []))
+        best_name, best_score = None, 0.0
+        for cf, cn in candidates:
+            if cf['name'] in used:
+                continue
+            score = difflib.SequenceMatcher(None, n, cn, autojunk=False).ratio()
+            if score > best_score:
+                best_name, best_score = cf['name'], score
+        if best_name and best_score >= 0.88:
+            result[f['name']] = best_name
+            used.add(best_name)
+    return result
+
+
+def analyze_pipeline(target: Path, work: Path) -> tuple[dict, str, str]:
+    _, machine = elf_info(target)
+    version = os.environ.get('UNITY_VERSION_OVERRIDE') or detect_unity_version(target)
+    clean = download_clean_libunity(work, version, machine)
+    target_pseudo, clean_pseudo = work / 'bad.txt', work / 'good.txt'
+    export_pseudocode(target, target_pseudo, work)
+    export_pseudocode(clean, clean_pseudo, work)
+    target_funcs = load_pseudocode(target_pseudo)
+    clean_funcs = load_pseudocode(clean_pseudo)
+    mapping = map_decompiled(target_funcs, clean_funcs)
+    return mapping, version, f'Unity {version}; target functions {len(target_funcs):,}; clean functions {len(clean_funcs):,}; mappings {len(mapping):,}'
+
 
 @app.get('/')
-def index(): return render_template_string(HTML)
+def index():
+    return HTML
+
 
 @app.post('/analyze')
 def analyze_route():
-    if 'libunity' not in request.files: return jsonify(error='Select libunity.so'),400
-    upload=request.files['libunity']
-    if not upload.filename.endswith('.so'): return jsonify(error='Expected a .so ELF shared library'),400
-    work=Path(tempfile.mkdtemp(prefix='symbolmap-'))
+    upload = request.files.get('libunity')
+    if not upload or not upload.filename.lower().endswith('.so'):
+        return jsonify(error='Select a libunity.so ELF shared library.'), 400
+    work = Path(tempfile.mkdtemp(prefix='symbolmap-'))
     try:
-        target=work/'libunity.so'; upload.save(target)
-        with open(target,'rb') as fp:
-            if fp.read(4)!=b'\x7fELF': raise RuntimeError('The selected file is not an ELF binary.')
-        mappings,fns,strs=analyze(target)
-        result={'symbols':mappings,'metadata':{'function_count':len(fns),'string_count':len(strs),'note':'Only mappings provable from the uploaded binary are emitted. Recovering an obfuscated original name requires a clean reference implementation; this tool does not fabricate mappings.'}}
-        out=work/'SymbolMap.json';out.write_text(json.dumps(result,indent=2)+'\n')
-        return jsonify(id=work.name,message=f'Analysis complete.\nFunctions: {len(fns):,}\nStrings: {len(strs):,}\nMappings: {len(mappings):,}\n\nSymbolMap.json is ready.')
+        target = work / 'libunity.so'
+        upload.save(target)
+        mapping, version, summary = analyze_pipeline(target, work)
+        out = work / 'SymbolMap.json'
+        out.write_text(json.dumps(mapping, indent=2) + '\n', encoding='utf-8')
+        return jsonify(id=work.name, message=f'Completed.\n{summary}\n\nDetected clean Unity reference automatically.\nSymbolMap.json downloaded next.\n\nThe uploaded game library and clean reference stayed in the local temporary directory.')
     except Exception as e:
-        shutil.rmtree(work,ignore_errors=True);return jsonify(error=str(e)),500
+        shutil.rmtree(work, ignore_errors=True)
+        return jsonify(error=str(e)), 500
+
 
 @app.get('/download/<job>')
-def download(job):
-    # Job directory is deliberately outside the repository and is removed after download.
-    root=Path(tempfile.gettempdir())/job/'SymbolMap.json'
-    if not root.exists(): return 'Not found',404
-    return send_file(root,as_attachment=True,download_name='SymbolMap.json',mimetype='application/json')
+def download(job: str):
+    root = Path(tempfile.gettempdir()) / job / 'SymbolMap.json'
+    if not root.exists():
+        return 'Not found', 404
+    return send_file(root, as_attachment=True, download_name='SymbolMap.json', mimetype='application/json')
 
-if __name__=='__main__': app.run(host='127.0.0.1',port=int(os.environ.get('PORT','5000')))
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=int(os.environ.get('PORT', '5000')))

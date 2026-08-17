@@ -7,19 +7,18 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string, request, send_file
+from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 MAX_MB = int(os.environ.get('MAX_UPLOAD_MB', '2048'))
 app.config['MAX_CONTENT_LENGTH'] = MAX_MB * 1024 * 1024
 REPO = 'LavaGang/MelonLoader.UnityDependencies'
 
-# The server is deliberately local-only when run normally. The uploaded library is kept
-# under a temporary directory and is removed on errors; the final JSON is also temporary.
 HTML = open(Path(__file__).with_name('index.html'), encoding='utf-8').read()
 
 
@@ -52,8 +51,6 @@ def strings_text(path: Path) -> str:
 
 def detect_unity_version(path: Path) -> str:
     text = strings_text(path)
-    # Unity commonly leaves its editor/runtime version in plain ASCII. Accept both
-    # exact f/build forms and the shorter release form used by UnityDependencies.
     pats = [
         r'Unity\s+(20\d{2}\.\d+\.\d+(?:f\d+)?)',
         r'\b(20\d{2}\.\d+\.\d+f\d+)\b',
@@ -62,8 +59,7 @@ def detect_unity_version(path: Path) -> str:
     for pat in pats:
         m = re.search(pat, text)
         if m:
-            v = m.group(1)
-            return re.sub(r'f\d+$', '', v)
+            return re.sub(r'f\d+$', '', m.group(1))
     raise RuntimeError('Could not detect a Unity version from libunity.so. Set UNITY_VERSION_OVERRIDE to the matching Unity release before starting the server.')
 
 
@@ -73,15 +69,13 @@ def unity_release(version: str) -> dict:
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.load(r)
 
-    tag_url = f'https://api.github.com/repos/{REPO}/releases/tags/{version}'
     try:
-        x = get(tag_url)
+        x = get(f'https://api.github.com/repos/{REPO}/releases/tags/{version}')
         if isinstance(x, dict):
             return x
     except Exception:
         pass
 
-    # Fall back to release pages and locate a tag that starts with the detected version.
     for page in range(1, 5):
         arr = get(f'https://api.github.com/repos/{REPO}/releases?per_page=100&page={page}')
         if not isinstance(arr, list):
@@ -99,8 +93,6 @@ def download_clean_libunity(work: Path, version: str, machine: int) -> Path:
     if not assets:
         raise RuntimeError(f'UnityDependencies {version} has no downloadable assets.')
 
-    # Prefer Android/runtime archives. We still inspect archive contents rather than
-    # trusting the asset name because the repository has changed packaging over time.
     preferred = []
     for asset in assets:
         name = str(asset.get('name', ''))
@@ -158,8 +150,7 @@ def export_pseudocode(binary: Path, output: Path, job: Path) -> None:
         raise RuntimeError('Ghidra headless is required. Set GHIDRA_HOME (or GHIDRA_HEADLESS) to a Ghidra installation.')
     project_dir = job / ('ghidra-' + binary.stem)
     project_dir.mkdir(parents=True, exist_ok=True)
-    project_name = 'symbolmap'
-    cmd = [str(headless), str(project_dir), project_name, '-import', str(binary), '-scriptPath', str(Path(__file__).parent), '-postScript', 'ExportPseudo.java', str(output), '-deleteProject']
+    cmd = [str(headless), str(project_dir), 'symbolmap', '-import', str(binary), '-scriptPath', str(Path(__file__).parent), '-postScript', 'ExportPseudo.java', str(output), '-deleteProject']
     run(cmd, cwd=job, timeout=3600)
     if not output.exists() or output.stat().st_size == 0:
         raise RuntimeError(f'Ghidra did not produce pseudocode for {binary.name}.')
@@ -168,9 +159,7 @@ def export_pseudocode(binary: Path, output: Path, job: Path) -> None:
 def load_pseudocode(path: Path) -> list[dict]:
     raw = path.read_text(encoding='utf-8', errors='replace')
     records = []
-    # Format emitted by ExportPseudo.java: a header line followed by C text until the next header.
-    chunks = re.split(r'(?m)^@@FUNC@@\t', raw)
-    for chunk in chunks[1:]:
+    for chunk in re.split(r'(?m)^@@FUNC@@\t', raw)[1:]:
         lines = chunk.splitlines()
         if not lines:
             continue
@@ -187,19 +176,17 @@ def normalize(code: str, names: set[str]) -> str:
     x = re.sub(r'//.*', ' ', x)
     x = re.sub(r'0x[0-9A-Fa-f]+', ' ADDR ', x)
     x = re.sub(r'\b\d+(?:\.\d+)?\b', ' NUM ', x)
-    # Ghidra local identifiers and generated function labels are not stable between binaries.
     x = re.sub(r'\b(local|param|in_stack|unaff|extraout|uVar|iVar|fVar|dVar|cVar|bVar|auVar|puVar)_\w+\b', ' VAR ', x)
     for n in sorted(names, key=len, reverse=True):
         if n:
             x = re.sub(r'(?<![\w$])' + re.escape(n) + r'(?![\w$])', ' FUNC ', x)
-    x = re.sub(r'\s+', ' ', x).strip()
-    return x
+    return re.sub(r'\s+', ' ', x).strip()
 
 
 def map_decompiled(target: list[dict], clean: list[dict]) -> dict[str, str]:
     clean_names = {f['name'] for f in clean}
     target_names = {f['name'] for f in target}
-    clean_norm = [(f, normalize(f['code'], clean_names)) for f in clean]
+    clean_norm = [(f, normalize(f['code'], clean_names | target_names)) for f in clean]
     exact: dict[str, list[dict]] = {}
     for f, n in clean_norm:
         if n:
@@ -208,21 +195,19 @@ def map_decompiled(target: list[dict], clean: list[dict]) -> dict[str, str]:
     result: dict[str, str] = {}
     used: set[str] = set()
     for f in target:
-        n = normalize(f['code'], target_names | clean_names)
+        n = normalize(f['code'], clean_names | target_names)
         candidates = exact.get(n, [])
         if len(candidates) == 1 and candidates[0]['name'] not in used:
             result[f['name']] = candidates[0]['name']
             used.add(candidates[0]['name'])
 
-    # Similarity fallback for minor compiler/Ghidra differences. Restrict candidates by
-    # normalized size so matching stays tractable on large libunity.so files.
     buckets: dict[int, list[tuple[dict, str]]] = {}
     for f, n in clean_norm:
         buckets.setdefault(len(n) // 250, []).append((f, n))
     for f in target:
         if f['name'] in result:
             continue
-        n = normalize(f['code'], target_names | clean_names)
+        n = normalize(f['code'], clean_names | target_names)
         if not n:
             continue
         candidates = []
@@ -242,7 +227,7 @@ def map_decompiled(target: list[dict], clean: list[dict]) -> dict[str, str]:
     return result
 
 
-def analyze_pipeline(target: Path, work: Path) -> tuple[dict, str, str]:
+def analyze_pipeline(target: Path, work: Path) -> tuple[dict, str]:
     _, machine = elf_info(target)
     version = os.environ.get('UNITY_VERSION_OVERRIDE') or detect_unity_version(target)
     clean = download_clean_libunity(work, version, machine)
@@ -252,7 +237,8 @@ def analyze_pipeline(target: Path, work: Path) -> tuple[dict, str, str]:
     target_funcs = load_pseudocode(target_pseudo)
     clean_funcs = load_pseudocode(clean_pseudo)
     mapping = map_decompiled(target_funcs, clean_funcs)
-    return mapping, version, f'Unity {version}; target functions {len(target_funcs):,}; clean functions {len(clean_funcs):,}; mappings {len(mapping):,}'
+    summary = f'Unity {version}; target functions {len(target_funcs):,}; clean functions {len(clean_funcs):,}; mappings {len(mapping):,}'
+    return mapping, summary
 
 
 @app.get('/')
@@ -269,10 +255,10 @@ def analyze_route():
     try:
         target = work / 'libunity.so'
         upload.save(target)
-        mapping, version, summary = analyze_pipeline(target, work)
+        mapping, summary = analyze_pipeline(target, work)
         out = work / 'SymbolMap.json'
         out.write_text(json.dumps(mapping, indent=2) + '\n', encoding='utf-8')
-        return jsonify(id=work.name, message=f'Completed.\n{summary}\n\nDetected clean Unity reference automatically.\nSymbolMap.json downloaded next.\n\nThe uploaded game library and clean reference stayed in the local temporary directory.')
+        return jsonify(id=work.name, message=f'Completed.\n{summary}\n\nDetected and extracted the clean Unity reference automatically.\nSymbolMap.json is ready.\n\nThe game library and clean reference remained in the local temporary directory.')
     except Exception as e:
         shutil.rmtree(work, ignore_errors=True)
         return jsonify(error=str(e)), 500

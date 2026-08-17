@@ -1,47 +1,33 @@
 # SymbolMap Maker
 
-This project automates the workflow described in the tutorial from a single uploaded target `libunity.so`.
+Browser-only automation for the tutorial workflow: upload a single Android `libunity.so` and download `SymbolMap.json`.
 
-## Workflow
+## What happens
 
-1. Select the target `libunity.so` in the local web UI.
-2. The local backend validates the ELF and detects its architecture.
-3. It scans the library's strings for a Unity version.
-4. It queries the `LavaGang/MelonLoader.UnityDependencies` releases for that Unity version and downloads a matching clean runtime archive automatically.
-5. The backend extracts a clean `libunity.so` matching the detected architecture.
-6. Ghidra headless analyzes both libraries and `ExportPseudo.java` exports decompiled C-like pseudocode for every successfully decompiled function.
-7. The Python mapper normalizes generated names, addresses, comments, and common Ghidra temporaries, then performs exact and high-confidence similarity matching.
-8. The result is exported as `SymbolMap.json` and downloaded.
+1. The page reads the uploaded ELF locally and detects its Android architecture and Unity version from embedded strings.
+2. The browser queries the public `MelonLoader.UnityDependencies` release API and selects the matching clean `libunity.so` for that architecture.
+3. The clean reference is downloaded directly into browser memory.
+4. Rizin is loaded as WebAssembly and analyzes both libraries in-memory.
+5. The Pages build includes JSDec so the browser can generate C-like pseudocode with `pdd` without installing Ghidra or Rizin.
+6. Functions are matched first with normalized instruction signatures and then, for ambiguous candidates, with normalized decompiler output.
+7. High-confidence renamed-symbol matches are written to `SymbolMap.json` and downloaded.
 
-## Local-only upload
+## Privacy
 
-The browser sends the `.so` only to the Flask process listening on `127.0.0.1`. The target library and downloaded clean reference live under the OS temporary directory while the job runs and are not committed to GitHub.
+The target game binary is processed in the browser. It is not POSTed to this repository, a Flask server, or a decompilation service. The clean Unity dependency is fetched by the browser from its public release URL.
 
-## Setup
+## No local tools
 
-Install Java and Ghidra, then set `GHIDRA_HOME` to the Ghidra installation directory. The app specifically needs Ghidra's `support/analyzeHeadless` executable.
+There is no Python server, Ghidra install, Java install, LLVM install, or native reverse-engineering tool required.
 
-Also install Python 3 and an LLVM toolchain containing `llvm-strings` (the analyzer falls back to the platform `strings` command).
+## GitHub Pages
 
-Then run:
+`.github/workflows/pages.yml` builds Rizin + JSDec to WebAssembly with `rzwasi`, places the WASM engine beside the static site, and deploys the result to GitHub Pages on pushes to `main`.
 
-```bash
-bash run_local.sh
-```
+The upstream `rzwasi` project documents the browser-facing `rizin.js`/`rizin.wasm` artifacts and persistent `rzweb_*` session API. Its optional JSDec build enables the `pdd` decompiler command for browser use. citeturn14file0
 
-Open `http://127.0.0.1:5000`.
+## Accuracy
 
-### Version override
+This is the automated equivalent of the tutorial's clean-reference comparison rather than a fabricated name generator. Exact function identity is established from normalized code signatures first; ambiguous functions are checked with normalized pseudo-code. Compiler or build differences can still leave some functions unresolved, so only high-confidence mappings are exported.
 
-Some stripped libraries do not retain a readable Unity version. In that case set the exact Unity release used by the game before launching:
-
-```bash
-export UNITY_VERSION_OVERRIDE=2021.3.45
-bash run_local.sh
-```
-
-## Accuracy note
-
-This is substantially closer to the tutorial than simple ELF byte matching: it automatically obtains the clean Unity implementation and performs decompiler-based function matching. However, decompilers can produce different pseudocode for compiler, build, or optimization differences, so the mapper uses a conservative exact pass followed by a high-confidence similarity pass and does not claim unmatched functions are mapped.
-
-Unity runtime libraries in the dependency repository are Unity software and remain subject to Unity's applicable terms.
+Unity runtime libraries distributed by `MelonLoader.UnityDependencies` are Unity software and remain subject to Unity's applicable terms. citeturn545029search0

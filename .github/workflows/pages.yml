@@ -1,0 +1,74 @@
+name: Build browser analyzer and deploy Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout site
+        uses: actions/checkout@v4
+
+      - name: Checkout rzwasi
+        uses: actions/checkout@v4
+        with:
+          repository: IndAlok/rzwasi
+          path: rzwasi
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 'latest'
+          actions-cache-folder: 'emsdk-cache'
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip meson ninja-build pkg-config libcapstone-dev
+
+      - name: Build Rizin + JSDec for WebAssembly
+        working-directory: rzwasi
+        run: |
+          ./setup.sh install
+          source "$HOME/.emsdk/emsdk_env.sh"
+          ./build.sh --jsdec
+
+      - name: Assemble Pages site
+        run: |
+          rm -rf _site
+          mkdir -p _site/engine
+          cp index.html app.js _site/
+          cp rzwasi/dist/rizin.js _site/engine/rizin.js
+          cp rzwasi/dist/rizin.wasm _site/engine/rizin.wasm
+          printf '%s\n' 'SymbolMap Maker browser build' > _site/.nojekyll
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Deploy to Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

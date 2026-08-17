@@ -1,16 +1,144 @@
-const $=s=>document.querySelector(s);const input=$('#so'),go=$('#go'),stop=$('#stop'),status=$('#status'),nameEl=$('#name');let file=null,stopped=false,enginePromise=null;
-function log(t){status.textContent=t}
-async function netFetch(url,opts={}){let direct='';try{const r=await fetch(url,{...opts,mode:'cors'});direct=`${r.status} ${r.statusText}`;if(r.ok)return r;throw Error(`HTTP ${r.status}`)}catch(e){const proxy='https://corsproxy.io/?url='+encodeURIComponent(url);try{const r=await fetch(proxy,{mode:'cors'});if(r.ok)return r;throw Error(`proxy HTTP ${r.status}`)}catch(e2){try{const raw='https://api.allorigins.win/raw?url='+encodeURIComponent(url);const r=await fetch(raw,{mode:'cors'});if(r.ok)return r;throw Error(`fallback HTTP ${r.status}`)}catch(e3){throw Error(`Failed to fetch required remote data. Direct: ${e.message}. Proxy: ${e2.message}. Fallback: ${e3.message}.`)}}}}
-function versionFrom(bytes){const t=new TextDecoder('latin1').decode(bytes);for(const r of [/Unity\s+(\d{4}\.\d+\.\d+[abfp]\d+)/i,/\b(6000\.\d+\.\d+(?:[abfp]\d+)?)\b/i,/\b(\d{4}\.\d+\.\d+(?:[abfp]\d+)?)\b/i]){const m=t.match(r);if(m)return m[1]}return null}
-function elfArch(buf){const d=new Uint8Array(buf);if(d.length<20||d[0]!==127||d[1]!==69||d[2]!==76||d[3]!==70)throw Error('Not an ELF file.');if(d[5]!==1)throw Error('Only little-endian Android ELF files are supported.');const m=d[18]|d[19]<<8;if(m===183)return'arm64-v8a';if(m===40)return'armeabi-v7a';throw Error(`Unsupported Android architecture (e_machine=${m}).`)}
-async function findUnityAsset(version,arch){const base='https://api.github.com/repos/LavaGang/MelonLoader.UnityDependencies';const tags=[version,version.replace(/[abfp]\d+$/,'')];for(const tag of tags){const r=await netFetch(`${base}/releases/tags/${encodeURIComponent(tag)}`,{headers:{Accept:'application/vnd.github+json'}});if(r.ok){const rel=await r.json();const a=rel.assets?.find(x=>x.name===`libunity.so.${arch}`);if(a)return{release:rel.tag_name,url:a.browser_download_url}}}for(let p=1;p<=8;p++){const r=await netFetch(`${base}/releases?per_page=100&page=${p}`,{headers:{Accept:'application/vnd.github+json'}});if(!r.ok)break;const list=await r.json();if(!Array.isArray(list)||!list.length)break;for(const rel of list){const t=String(rel.tag_name||'');const v=version.replace(/[abfp]\d+$/,'');if(t!==version&&!t.startsWith(v+'.')&&!t.startsWith(v+'f'))continue;const a=rel.assets?.find(x=>x.name===`libunity.so.${arch}`);if(a)return{release:t,url:a.browser_download_url}}}throw Error(`No clean Unity reference found for ${version} (${arch}).`)}
-function loadEngine(){if(enginePromise)return enginePromise;enginePromise=new Promise((resolve,reject)=>{if(window.Module?.__rzwasiReady)return resolve(window.Module);window.Module={locateFile:n=>`engine/${n}`,onRuntimeInitialized(){window.Module.__rzwasiReady=true;resolve(window.Module)},onAbort:e=>reject(Error(`Rizin WASM aborted: ${e}`))};const s=document.createElement('script');s.src='engine/rizin.js';s.async=true;s.onload=()=>log('Browser analysis engine loaded.');s.onerror=()=>reject(Error('Could not load engine/rizin.js from the Pages site.'));document.head.appendChild(s)});return enginePromise}
-function session(M){const create=M.cwrap('rzweb_create_session','number',[]),open=M.cwrap('rzweb_open_file','number',['number','string','number','number']),cmd=M.cwrap('rzweb_cmd','string',['number','string']),close=M.cwrap('rzweb_close_session',null,['number']);const id=create();if(!id)throw Error('Could not create Rizin session.');return{id,open,cmd,close}}
-function jsonCmd(s,c){try{return JSON.parse(s.cmd(s.id,c))}catch{return null}}
-function sigOps(obj){const a=[];const w=v=>{if(!v||typeof v!=='object')return;if(Array.isArray(v)){v.forEach(w);return}if(typeof v.opcode==='string')a.push(v.opcode);else if(typeof v.disasm==='string')a.push(v.disasm);Object.keys(v).forEach(k=>{if(k!=='opcode'&&k!=='disasm')w(v[k])})};w(obj);return a.map(x=>String(x).toLowerCase().replace(/0x[0-9a-f]+/g,'IMM').replace(/\b-?\d+\b/g,'IMM').replace(/\b(sym\.imp|fcn\.|sub\.)[^\s,]+/g,'FUNC').replace(/\s+/g,' ').trim()).join('|')}
-async function analyzeFunctions(s,fs,label){const out=[];let n=0;for(const f of fs){if(stopped)throw Error('Stopped.');if(!f?.offset||!f?.size)continue;const raw=s.cmd(s.id,`pdfj @ ${f.offset}`);let o=null;try{o=JSON.parse(raw)}catch{}out.push({...f,sig:sigOps(o)});if(++n%25===0)log(`${label}: ${n.toLocaleString()} functions analyzed…`)}return out}
-function normPseudo(x,names){x=String(x||'').replace(/\/\*.*?\*\//gs,' ').replace(/\/\/.*$/gm,' ').replace(/0x[0-9a-f]+/gi,'ADDR').replace(/\b\d+(?:\.\d+)?\b/g,'NUM');for(const n of names)if(n)try{x=x.replace(new RegExp(`(?<![A-Za-z0-9_$])${n.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?![A-Za-z0-9_$])`,'g'),'FUNC')}catch{}return x.replace(/\s+/g,' ').trim()}
-function ratio(a,b){const n=Math.min(a.length,b.length);if(!n)return 0;let same=0;for(let i=0;i<n;i+=16)if(a.slice(i,i+16)===b.slice(i,i+16))same++;return same/Math.max(1,Math.ceil(Math.max(a.length,b.length)/16))}
-async function mapFns(ts,cs){const by=new Map(),result={},used=new Set();for(const f of cs){if(!f.sig)continue;const a=by.get(f.sig)||[];a.push(f);by.set(f.sig,a)}for(const f of ts){const c=by.get(f.sig)||[];if(c.length===1&&c[0].name!==f.name&&!used.has(c[0].name)){result[f.name]=c[0].name;used.add(c[0].name)}}for(const f of ts.filter(x=>!result[x.name]&&x.name&&!x.name.startsWith('sym.imp.'))){if(stopped)throw Error('Stopped.');const pool=cs.filter(x=>x.name&&!used.has(x.name)&&x.size===f.size);if(!pool.length||pool.length>10)continue;const tc=normPseudo('',[]);let best=null,bestScore=0;try{const raw=safeCmdTarget(`pdd @ ${f.offset}`);void raw}catch{}function safeCmdTarget(c){return window.__targetSession.cmd(window.__targetSession.id,c)}const targetCode=normPseudo(safeCmdTarget(`pdd @ ${f.offset}`),ts.map(x=>x.name));if(!targetCode)continue;for(const c of pool){const cc=normPseudo(window.__cleanSession.cmd(window.__cleanSession.id,`pdd @ ${c.offset}`),cs.map(x=>x.name));const sc=ratio(targetCode,cc);if(sc>bestScore){bestScore=sc;best=c}}if(best&&bestScore>=.78){result[f.name]=best.name;used.add(best.name)}}return result}
-async function main(){stopped=false;go.disabled=true;stop.disabled=false;try{log('Reading libunity.so locally…');const buf=await file.arrayBuffer(),arch=elfArch(buf),version=versionFrom(new Uint8Array(buf));if(!version)throw Error('Could not detect the Unity version from libunity.so.');log(`Detected Unity ${version} / ${arch}. Finding clean reference…`);const ref=await findUnityAsset(version,arch);log(`Found Unity ${ref.release}. Downloading clean reference…`);const rr=await netFetch(ref.url);if(!rr.ok)throw Error(`Clean reference download failed (${rr.status}).`);const clean=await rr.arrayBuffer();log('Loading Rizin + JSDec WebAssembly…');const M=await loadEngine(),t=session(M),c=session(M);window.__targetSession=t;window.__cleanSession=c;try{M.FS.writeFile('/target.so',new Uint8Array(buf));M.FS.writeFile('/clean.so',new Uint8Array(clean));if(!t.open(t.id,'/target.so',0,1)||!c.open(c.id,'/clean.so',0,1))throw Error('Rizin could not open one of the ELF libraries.');log('Analyzing target…');t.cmd(t.id,'aaa');log('Analyzing clean reference…');c.cmd(c.id,'aaa');const tf=jsonCmd(t,'aflj')||[],cf=jsonCmd(c,'aflj')||[];log(`Building function signatures: ${tf.length.toLocaleString()} target / ${cf.length.toLocaleString()} reference…`);const ts=await analyzeFunctions(t,tf,'Target'),cs=await analyzeFunctions(c,cf,'Reference');log('Matching functions…');const map=await mapFns(ts,cs);const blob=new Blob([JSON.stringify(map,null,2)+'\n'],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='SymbolMap.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);log(`Done.\nUnity: ${version}\nArchitecture: ${arch}\nTarget functions: ${ts.length.toLocaleString()}\nReference functions: ${cs.length.toLocaleString()}\nMappings: ${Object.keys(map).length.toLocaleString()}\n\nSymbolMap.json downloaded.\n\nThe target .so stayed in browser memory.`)}finally{try{t.close(t.id)}catch{}try{c.close(c.id)}catch{}delete window.__targetSession;delete window.__cleanSession}}catch(e){log(`Error: ${e.message||e}`)}finally{stop.disabled=true;go.disabled=!file}}
-input.onchange=()=>{file=input.files[0]||null;nameEl.textContent=file?`${file.name} — ${file.size.toLocaleString()} bytes`:'No file selected.';go.disabled=!file};go.onclick=main;stop.onclick=()=>{stopped=true;log('Stopping…')};loadEngine().then(()=>{go.disabled=!file}).catch(e=>log(e.message));
+const $ = (s) => document.querySelector(s);
+const input = $('#so'), go = $('#go'), stop = $('#stop'), status = $('#status'), nameEl = $('#name');
+let file = null, stopped = false, enginePromise = null;
+
+function log(text){ status.textContent = text; }
+async function fetchJson(url,label){
+  const candidates=[
+    url,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    `https://corsproxy.io/?url=${encodeURIComponent(url)}`
+  ];
+  let last='unknown error';
+  for(const u of candidates){
+    try{
+      const r=await fetch(u,{headers:{Accept:'application/vnd.github+json'}});
+      if(!r.ok){last=`HTTP ${r.status}`;continue;}
+      return await r.json();
+    }catch(e){last=e?.message||String(e)}
+  }
+  throw Error(`${label} failed: ${last}`);
+}
+async function fetchBinary(url,label){
+  const candidates=[
+    url,
+    `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    `https://cors.isomorphic-git.org/${url}`
+  ];
+  let last='unknown error';
+  for(const u of candidates){
+    try{
+      const r=await fetch(u);
+      if(!r.ok){last=`HTTP ${r.status}`;continue}
+      const b=await r.arrayBuffer();
+      if(b.byteLength<1024){last=`response too small (${b.byteLength} bytes)`;continue}
+      return b;
+    }catch(e){last=e?.message||String(e)}
+  }
+  throw Error(`${label} failed: ${last}`);
+}
+function versionFrom(bytes){
+  const text = new TextDecoder('latin1').decode(bytes);
+  const pats = [
+    /Unity\s+(\d{4}\.\d+\.\d+[abfp]\d+)/i,
+    /\b(6000\.\d+\.\d+(?:[abfp]\d+)?)\b/i,
+    /\b(\d{4}\.\d+\.\d+(?:[abfp]\d+)?)\b/i
+  ];
+  for (const r of pats){ const m = text.match(r); if (m) return m[1]; }
+  return null;
+}
+function elfArch(buf){
+  const d = new Uint8Array(buf);
+  if(d[0]!==0x7f||d[1]!==0x45||d[2]!==0x4c||d[3]!==0x46) throw Error('Not an ELF file.');
+  if(d[5]!==1) throw Error('Only little-endian Android ELF files are supported.');
+  const machine=d[18]|(d[19]<<8);
+  if(machine===183) return 'arm64-v8a';
+  if(machine===40) return 'armeabi-v7a';
+  throw Error(`Unsupported Android architecture (e_machine=${machine}).`);
+}
+async function findUnityAsset(version, arch){
+  const base='https://api.github.com/repos/LavaGang/MelonLoader.UnityDependencies';
+  const tags=[version, version.replace(/[abfp]\d+$/,'')];
+  for(const tag of tags){
+    try{
+      const rel=await fetchJson(`${base}/releases/tags/${encodeURIComponent(tag)}`,`UnityDependencies metadata (${tag})`);
+      const a=rel.assets?.find(x=>x.name===`libunity.so.${arch}`);
+      if(a) return {release:rel.tag_name,url:a.browser_download_url};
+    }catch{}
+  }
+  for(let page=1;page<=8;page++){
+    let list;
+    try{list=await fetchJson(`${base}/releases?per_page=100&page=${page}`,`UnityDependencies release list (page ${page})`)}catch(e){throw e}
+    if(!Array.isArray(list)||!list.length) break;
+    for(const rel of list){
+      const t=String(rel.tag_name||'');
+      const close=t===version||t.startsWith(version+'.')||t.startsWith(version.replace(/[abfp]\d+$/,'')+'.');
+      if(!close) continue;
+      const a=rel.assets?.find(x=>x.name===`libunity.so.${arch}`);
+      if(a) return {release:t,url:a.browser_download_url};
+    }
+  }
+  throw Error(`No matching clean Unity dependency was found for ${version} (${arch}).`);
+}
+function loadEngine(){
+  if(enginePromise) return enginePromise;
+  enginePromise=new Promise((resolve,reject)=>{
+    if(window.Module?.__rzwasiReady){ resolve(window.Module); return; }
+    const previous=window.Module;
+    window.Module = {
+      ...(previous||{}),
+      locateFile: (name)=>`engine/${name}`,
+      onRuntimeInitialized(){
+        window.Module.__rzwasiReady=true;
+        resolve(window.Module);
+      },
+      onAbort:(e)=>reject(new Error(`Rizin WASM aborted: ${e||'unknown abort'}`))
+    };
+    const s=document.createElement('script');
+    s.src='engine/rizin.js'; s.async=true;
+    s.onerror=()=>reject(new Error('Browser engine script could not be loaded from engine/rizin.js.'));
+    document.head.appendChild(s);
+  });
+  return enginePromise;
+}
+function createSession(M){
+  const create=M.cwrap('rzweb_create_session','number',[]);
+  const open=M.cwrap('rzweb_open_file','number',['number','string','number','number']);
+  const cmd=M.cwrap('rzweb_cmd','string',['number','string']);
+  const close=M.cwrap('rzweb_close_session',null,['number']);
+  const id=create(); if(!id) throw Error('Could not create a Rizin analysis session.');
+  return {id,open,cmd,close};
+}
+function jsonCmd(s,cmd){ const out=s.cmd(s.id,cmd); try{return JSON.parse(out)}catch{return null} }
+function normAsm(x){ return String(x||'').toLowerCase().replace(/0x[0-9a-f]+/g,' IMM ').replace(/\b-?\d+\b/g,' IMM ').replace(/\s+/g,' ').replace(/\b(sym\.imp|fcn\.|sub\.)[^\s,]+/g,' FUNC ').trim(); }
+function opsFromPdfj(obj){ const out=[]; const walk=(v)=>{ if(!v||typeof v!=='object') return; if(Array.isArray(v)){for(const x of v) walk(x);return} if(typeof v.opcode==='string') out.push(v.opcode); else if(typeof v.disasm==='string') out.push(v.disasm); for(const k of Object.keys(v)) if(k!=='opcode'&&k!=='disasm') walk(v[k]); }; walk(obj); return out; }
+async function functionSignatures(s, funcs, label){
+  const map=[]; let i=0;
+  for(const f of funcs){ if(stopped) throw Error('Stopped.'); if(!f?.offset||!f?.size) continue; const raw=s.cmd(s.id,`pdfj @ ${f.offset}`); let obj; try{obj=JSON.parse(raw)}catch{obj=null} const ops=opsFromPdfj(obj); map.push({...f,sig:ops.map(normAsm).join('|')}); i++; if(i%20===0) log(`${label}: ${i.toLocaleString()} functions analyzed…`); }
+  return map;
+}
+async function decompile(s,addr){ try{return String(s.cmd(s.id,`pdd @ ${addr}`)||'')}catch{return ''} }
+function normPseudo(code,names){ let x=String(code||'').replace(/\/\*.*?\*\//gs,' ').replace(/\/\/.*$/gm,' '); x=x.replace(/0x[0-9a-f]+/gi,' ADDR ').replace(/\b\d+(?:\.\d+)?\b/g,' NUM '); return x.replace(/\s+/g,' ').trim(); }
+async function mapFunctions(targetSession,cleanSession,targetFuncs,cleanFuncs){
+  const cleanBySig=new Map(); for(const f of cleanFuncs){if(!f.sig)continue;const a=cleanBySig.get(f.sig)||[];a.push(f);cleanBySig.set(f.sig,a)}
+  const result={},used=new Set(); for(const f of targetFuncs){const c=cleanBySig.get(f.sig)||[];if(c.length===1&&c[0].name!==f.name&&!used.has(c[0].name)){result[f.name]=c[0].name;used.add(c[0].name)}}
+  const unresolved=targetFuncs.filter(f=>!result[f.name]&&f.name&&!f.name.startsWith('sym.imp.')); const candidates=cleanFuncs.filter(f=>f.name&&!f.name.startsWith('sym.imp.')&&!used.has(f.name)); const groups=new Map(); for(const f of candidates){const k=`${f.size}:${f.sig.split('|').length}`;const a=groups.get(k)||[];a.push(f);groups.set(k,a)}
+  let count=0; for(const f of unresolved){if(stopped)throw Error('Stopped.'); const pool=groups.get(`${f.size}:${f.sig.split('|').length}`)||[]; if(!pool.length||pool.length>12)continue; const tc=normPseudo(await decompile(targetSession,f.offset),[]); if(!tc)continue; let best=null,score=0; for(const c of pool){if(used.has(c.name))continue;const cc=normPseudo(await decompile(cleanSession,c.offset),[]);if(!cc)continue;const n=Math.min(tc.length,cc.length);let same=0;for(let i=0;i<n;i+=16)if(tc.slice(i,i+16)===cc.slice(i,i+16))same++;const ratio=same/Math.max(1,Math.ceil(Math.max(tc.length,cc.length)/16));if(ratio>score){score=ratio;best=c}} if(best&&score>=0.78&&best.name!==f.name){result[f.name]=best.name;used.add(best.name)} count++;if(count%5===0)log(`Decompiler fallback: ${count} ambiguous functions checked…`)} return result;
+}
+async function main(){
+  stopped=false;stop.disabled=false;go.disabled=true;
+  try{
+    log('Reading libunity.so locally…'); const buf=await file.arrayBuffer(); const arch=elfArch(buf); const version=versionFrom(new Uint8Array(buf)); if(!version)throw Error('Could not detect the Unity version from libunity.so.');
+    log(`Detected Unity ${version} / ${arch}. Looking up the clean reference…`); const ref=await findUnityAsset(version,arch); log(`Found clean Unity ${ref.release}. Downloading reference…`);
+    const rb=await fetchBinary(ref.url,`Clean Unity ${ref.release} reference download`); if(stopped)throw Error('Stopped.');
+    log(`Clean reference downloaded (${(rb.byteLength/1048576).toFixed(1)} MB). Loading browser analysis engine…`); const M=await loadEngine();
+    const t=createSession(M),c=createSession(M); try{
+      M.FS.writeFile('/target.so',new Uint8Array(buf)); M.FS.writeFile('/clean.so',new Uint8Array(rb)); if(!t.open(t.id,'/target.so',0,1)||!c.open(c.id,'/clean.so',0,1))throw Error('Rizin could not open one of the ELF libraries.');
+      log('Analyzing target library…'); t.cmd(t.id,'aaa'); log('Analyzing clean Unity reference…'); c.cmd(c.id,'aaa'); const tf=jsonCmd(t,'aflj')||[],cf=jsonCmd(c,'aflj')||[]; log(`Functions discovered: target ${tf.length.toLocaleString()} / clean ${cf.length.toLocaleString()}. Building instruction signatures…`); const ts=await functionSignatures(t,tf,'Target'),cs=await functionSignatures(c,cf,'Reference'); log('Matching functions…'); const map=await mapFunctions(t,c,ts,cs); const blob=new Blob([JSON.stringify(map,null,2)+'\n'],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='SymbolMap.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000); log(`Done.\nUnity: ${version}\nArchitecture: ${arch}\nTarget functions: ${ts.length.toLocaleString()}\nReference functions: ${cs.length.toLocaleString()}\nMappings: ${Object.keys(map).length.toLocaleString()}\n\nSymbolMap.json downloaded.\n\nThe target .so stayed in browser memory.`);
+    }finally{try{t.close(t.id)}catch{}try{c.close(c.id)}catch{}}
+  }catch(e){log(`Error: ${e.message||e}`)}finally{stop.disabled=true;go.disabled=!file}
+}
+input.onchange=()=>{file=input.files[0]||null;nameEl.textContent=file?`${file.name} — ${file.size.toLocaleString()} bytes`:'No file selected.';go.disabled=!file};
+go.onclick=main;stop.onclick=()=>{stopped=true;log('Stopping after the current browser analysis call…')};
+loadEngine().then(()=>{log('Browser analysis engine ready. Select libunity.so.');go.disabled=!file}).catch(e=>log(e.message));

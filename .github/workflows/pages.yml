@@ -41,9 +41,14 @@ jobs:
       - name: Build Rizin + JSDec for WebAssembly
         working-directory: rzwasi
         run: |
-          ./setup.sh install
+          bash ./setup.sh install
           source "$HOME/.emsdk/emsdk_env.sh"
-          ./build.sh --jsdec
+          bash ./build.sh --jsdec
+
+      - name: Verify browser engine artifacts
+        run: |
+          test -s rzwasi/dist/rizin.js
+          test -s rzwasi/dist/rizin.wasm
 
       - name: Assemble Pages site
         run: |
@@ -53,6 +58,7 @@ jobs:
           cp rzwasi/dist/rizin.js _site/engine/rizin.js
           cp rzwasi/dist/rizin.wasm _site/engine/rizin.wasm
           printf '%s\n' 'SymbolMap Maker browser build' > _site/.nojekyll
+          find _site -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
